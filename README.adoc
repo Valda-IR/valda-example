@@ -1,0 +1,169 @@
+= Valda Example Project
+
+In this example, we will be patching a very simple DEX file.
+
+The example DEX file is a simple `curl` clone. It is compiled from the project using `dx --dex --output=input.dex target/valda-example-1.0-SNAPSHOT.jar` and executed with `art -cp input.dex at.yawk.valda.example.ExampleDex https://google.com`
+
+You can find the code that is being transformed in `at.yawk.valda.example.ExampleDex`. The transformation code described below is in `at.yawk.valda.example.Main`.
+
+== Setup
+
+First, we add the `valda-ir` (for the core API) and the `valda-dexlib2` (for DEX support) dependencies to the project `pom.xml` file.
+
+Valda has been published to maven central.
+
+[source,xml]
+----
+<dependency>
+    <groupId>at.yawk.valda</groupId>
+    <artifactId>valda-ir</artifactId>
+    <version>1.0.0</version>
+</dependency>
+<dependency>
+    <groupId>at.yawk.valda</groupId>
+    <artifactId>valda-dexlib2</artifactId>
+    <version>1.0.0</version>
+</dependency>
+----
+
+As an alternative to Maven, Gradle can also be used.
+
+== Parsing the DEX file
+
+Valda uses the link:https://github.com/JesusFreke/smali/tree/master/dexlib2[dexlib2 library] to interact with the DEX file format. To use Valda, we must first obtain a dexlib2 representation of the file in the form of a `DexFile` instance. The easiest way to get such an instance is using the `DexFileFactory`:
+
+[source,java]
+----
+DexFile dexFile = DexFileFactory.loadDexFile("input.dex", Opcodes.getDefault());
+----
+
+The next step is to feed this DEX file into Valda. Valda manages all types on a `Classpath`. The `DexParser` class can transform a dexlib2 `DexFile` to a `Classpath`:
+
+[source,java]
+----
+DexParser dexParser = new DexParser();
+dexParser.add(dexFile);
+Classpath classpath = dexParser.parse();
+----
+
+== Transforming the DEX
+
+Now that we have a `Classpath` of the DEX file, we can actually start processing it. Our goal in this example will be to intercept all calls to `URL.openStream()` and print out the URL just before the call is made.
+
+First, we will get a `TypeMirror` of the `URL` class. While `URL` is part of the standard library and not part of the DEX file we are working with, it still has a `TypeMirror` (specifically an `ExternalTypeMirror`) on the `Classpath` because it is used in code that is part of the DEX file.
+
+[source,java]
+----
+TypeMirror urlType = classpath.getTypeMirror(Type.getType(URL.class));
+----
+
+[WARNING]
+While in this case we can use `Type.getType(URL.class)`, in most cases it will be necessary to pass the class name as a string instead. In that case, the syntax would be `Type.getType("Ljava/net/URL;")`, using the so-called _internal name_ of the class. Be careful in getting the format right, or you will simply not find the class -- there will be no useful error.
+
+The next step is getting the `openStream` method. `openStream` returns an `InputStream` and is not static.
+
+[source,java]
+----
+MethodMirror openStream = urlType.method("openStream", Type.getMethodType(Type.getType(InputStream.class)), TriState.FALSE);
+----
+
+Now that we have found the method that we want to intercept calls to, we have to decide _how_ to intercept these calls. There are three common approaches:
+
+1. Alter the `openStream` method to add the log statement
+2. Add the log statement before every call to the `openStream` method
+3. Replace all calls to `openStream` with a delegate method that does the logging
+
+In this case, approach 1 is impossible since the `URL` class is part of the standard library. For this demonstration, we will take approach 2, but 3 would work just as well.
+
+First, we find all method calls to the `openStream` method. Valda keeps a list of these references, so we will just use that:
+
+[source,java]
+----
+Iterable<MethodReference.Invoke> invokes =
+        openStream.getReferences().listReferences(MethodReference.Invoke.class);
+for (MethodReference.Invoke invokeReference : invokes) {
+    Invoke invoke = invokeReference.getInstruction();
+
+    // ...
+}
+----
+
+Now we have a reference to the actual instruction where `openStream` is called. We will now generate some code to generate the log statement. This is quite verbose. First, a look at the code that we will generate, in Java form:
+
+[source,java]
+----
+StringBuilder stringBuilder = new StringBuilder();
+stringBuilder.append("openStream() called: ");
+stringBuilder.append(url);
+String string = stringBuilder.toString();
+PrintStream systemOut = System.out;
+systemOut.println(string);
+----
+
+And the code to generate it (where `invoke` is the instruction from above):
+
+[source,java]
+----
+// prepare the methods we need
+Type stringBuilderType = Type.getType(StringBuilder.class);
+TypeMirror sbTypeMirror = classpath.getTypeMirror(stringBuilderType);
+// need to hint valda that StringBuilder is not, in fact, an interface
+((ExternalTypeMirror) sbTypeMirror).setInterface(false);
+// StringBuilder.<init>()V
+MethodMirror sbConstructor = sbTypeMirror
+        .method("<init>", Type.getMethodType(Type.VOID_TYPE), TriState.FALSE);
+// StringBuilder.append(Ljava/lang/Object;)Ljava/lang/StringBuilder;
+MethodMirror sbAppend = sbTypeMirror
+        .method("append", Type.getMethodType(stringBuilderType, Types.OBJECT), TriState.FALSE);
+// StringBuilder.toString()Ljava/lang/String;
+MethodMirror sbToString = sbTypeMirror
+        .method("toString", Type.getMethodType(Type.getType(String.class)), TriState.FALSE);
+
+// stringBuilder = new StringBuilder();
+LocalVariable stringBuilder = LocalVariable.reference();
+invoke.addBefore(Invoke.builder().newInstance().method(sbConstructor).returnValue(stringBuilder).build());
+
+// stringBuilder.append("openStream() called: ");
+LocalVariable stringConst = LocalVariable.reference();
+invoke.addBefore(Const.createString(stringConst, "openStream() called: "));
+invoke.addBefore(Invoke.builder().method(sbAppend).parameter(stringBuilder).parameter(stringConst).build());
+
+// stringBuilder.append(url);
+LocalVariable url = invoke.getParameters().get(0);
+invoke.addBefore(Invoke.builder().method(sbAppend).parameter(stringBuilder).parameter(url).build());
+
+// string = stringBuilder.toString();
+LocalVariable string = LocalVariable.reference();
+invoke.addBefore(Invoke.builder().method(sbToString).parameter(stringBuilder).returnValue(string).build());
+
+// systemOut = System.out;
+FieldMirror systemOutField = classpath.getTypeMirror(Type.getType(System.class))
+        .field("out", Type.getType(PrintStream.class), TriState.TRUE);
+LocalVariable systemOut = LocalVariable.reference();
+invoke.addBefore(LoadStore.load().field(systemOutField).value(systemOut).build());
+
+// systemOut.println(string);
+MethodMirror println = classpath.getTypeMirror(Type.getType(PrintStream.class))
+        .method("println", Type.getMethodType(Type.VOID_TYPE, Type.getType(String.class)), TriState.FALSE);
+invoke.addBefore(Invoke.builder().method(println).parameter(systemOut).parameter(string).build());
+----
+
+Generating bytecode can become quite involved. For more complex tasks, using `valda-kotlin` is recommended.
+
+== Writing back the DEX
+
+Now that the transformation is complete, we can write back the DEX file to the file system. First, we need to transform the Valda `Classpath` back to a dexlib2 `DexFile`:
+
+[source,java]
+----
+DexFile outputFile = new DexCompiler().compile(classpath);
+----
+
+And finally, we use dexlib2 to write the DEX again.
+
+[source,java]
+----
+DexFileFactory.writeDexFile("output.dex", outputFile);
+----
+
+If we now run `art -cp output.dex at.yawk.valda.example.ExampleDex https://google.com`, we will now see a line `openStream() called: https://google.com`.
